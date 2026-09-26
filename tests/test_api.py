@@ -2439,3 +2439,380 @@ def test_concurrent_seal_and_preparation_never_slips_through(client):
     first_reject = next((i for i, c in enumerate(codes) if c == 409), None)
     if first_reject is not None:
         assert all(c == 409 for c in codes[first_reject:])
+
+
+# --------------------------------------------------------------------------- #
+# POST /inventory-counts/preview + POST /inventory-counts + GET /inventory-counts/{id}
+# --------------------------------------------------------------------------- #
+
+
+def count_preview(client, items):
+    return client.post("/inventory-counts/preview", json={"items": items})
+
+
+def commit_count(client, items, reason="账实核对"):
+    return client.post("/inventory-counts", json={"items": items, "reason": reason})
+
+
+def commit_from_preview(client, preview_body, reason="账实核对"):
+    return commit_count(client, preview_body["items"], reason)
+
+
+def test_inventory_count_preview_returns_book_actual_and_difference(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 4)
+    # S3 从未补入：账面按 0
+
+    r = count_preview(client, [
+        {"sample_id": s3, "actual_count": 2},  # 乱序请求
+        {"sample_id": s1, "actual_count": 8},  # 盘亏 2
+        {"sample_id": s2, "actual_count": 7},  # 盘盈 3
+    ])
+    assert r.status_code == 200, r.text
+    assert r.json() == {"items": [
+        {"sample_id": s1, "sample_name": "S1",
+         "book_count": 10, "actual_count": 8, "difference": -2},
+        {"sample_id": s2, "sample_name": "S2",
+         "book_count": 4, "actual_count": 7, "difference": 3},
+        {"sample_id": s3, "sample_name": "S3",
+         "book_count": 0, "actual_count": 2, "difference": 2},
+    ]}
+
+
+def test_inventory_count_preview_zero_difference_and_zero_actual(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    add_inventory(client, s1, 5)
+
+    r = count_preview(client, [
+        {"sample_id": s1, "actual_count": 5},  # 账实相符
+        {"sample_id": s2, "actual_count": 0},  # 无库存行且实盘 0
+    ])
+    assert r.status_code == 200, r.text
+    assert r.json()["items"] == [
+        {"sample_id": s1, "sample_name": "S1",
+         "book_count": 5, "actual_count": 5, "difference": 0},
+        {"sample_id": s2, "sample_name": "S2",
+         "book_count": 0, "actual_count": 0, "difference": 0},
+    ]
+
+
+def test_inventory_count_preview_is_readonly(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 5)
+    before = get_inventory(client, s1).json()
+
+    r = count_preview(client, [{"sample_id": s1, "actual_count": 3}])
+    assert r.status_code == 200, r.text
+
+    # 预演不写库存、不留盘点记录，且可重复调用结果一致
+    assert get_inventory(client, s1).json() == before
+    assert client.get("/inventory-counts/1").status_code == 404
+    assert count_preview(client, [{"sample_id": s1, "actual_count": 3}]).json() == r.json()
+
+
+def test_inventory_count_preview_unknown_or_non_sample_rejected(client):
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+
+    r = count_preview(client, [{"sample_id": 999, "actual_count": 1}])
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+    r = count_preview(client, [{"sample_id": p1, "actual_count": 1}])
+    assert r.status_code == 400
+    assert str(p1) in r.json()["detail"]
+    assert "原始样本" in r.json()["detail"]
+    # 校验失败不写任何记录
+    assert client.get("/inventory-counts/1").status_code == 404
+
+
+def test_inventory_count_preview_rejects_empty_duplicate_and_invalid_counts(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+
+    assert count_preview(client, []).status_code == 422  # 空清单
+    r = count_preview(client, [
+        {"sample_id": s1, "actual_count": 1},
+        {"sample_id": s1, "actual_count": 2},
+    ])
+    assert r.status_code == 422
+    assert "重复" in r.json()["detail"][0]["msg"]
+    # 样本 id 非正整数
+    assert count_preview(client, [{"sample_id": 0, "actual_count": 1}]).status_code == 422
+    # 实盘份数负数 / 小数 / 字符串 / 布尔
+    for bad in (-1, 1.5, 2.0, "2", True):
+        assert count_preview(client, [
+            {"sample_id": s1, "actual_count": bad}]).status_code == 422
+    # 合法的 0 份接受
+    assert count_preview(client, [
+        {"sample_id": s2, "actual_count": 0}]).status_code == 200
+
+
+def test_commit_inventory_count_updates_balances_and_persists_details(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 4)
+    updated_at_s1 = get_inventory(client, s1).json()["updated_at"]
+
+    preview = count_preview(client, [
+        {"sample_id": s1, "actual_count": 8},   # 盘亏：10 → 8
+        {"sample_id": s2, "actual_count": 7},   # 盘盈：4 → 7
+        {"sample_id": s3, "actual_count": 3},   # 无库存行：0 → 3，补建余额行
+    ]).json()
+
+    r = commit_from_preview(client, preview, reason="月度盘点，盘盈盘亏调整")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["reason"] == "月度盘点，盘盈盘亏调整"
+    assert isinstance(body["created_at"], str) and body["created_at"]
+    assert body["items"] == preview["items"]
+
+    count_id = body["id"]
+    # 余额已按实盘数校准
+    assert get_inventory(client, s1).json()["balance"] == 8
+    assert get_inventory(client, s2).json()["balance"] == 7
+    s3_inv = get_inventory(client, s3).json()
+    assert s3_inv["balance"] == 3
+    assert s3_inv["updated_at"] is not None
+    # 盘亏/盘盈不改写已有库存行的 updated_at
+    assert get_inventory(client, s1).json()["updated_at"] == updated_at_s1
+
+    # GET 返回与提交一致的盘点明细
+    got = client.get(f"/inventory-counts/{count_id}")
+    assert got.status_code == 200, r.text
+    assert got.json() == body
+
+
+def test_commit_inventory_count_zero_actual_sets_balance_to_zero(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 6)
+
+    preview = count_preview(client, [{"sample_id": s1, "actual_count": 0}]).json()
+    r = commit_from_preview(client, preview)
+    assert r.status_code == 201, r.text
+    assert r.json()["items"] == [{
+        "sample_id": s1, "sample_name": "S1",
+        "book_count": 6, "actual_count": 0, "difference": -6}]
+    assert get_inventory(client, s1).json()["balance"] == 0
+
+
+def test_commit_inventory_count_equal_book_and_actual_changes_nothing(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    add_inventory(client, s1, 5)
+    before_s1 = get_inventory(client, s1).json()
+    before_s2 = get_inventory(client, s2).json()
+
+    preview = count_preview(client, [
+        {"sample_id": s1, "actual_count": 5},  # 账实相符（有库存行）
+        {"sample_id": s2, "actual_count": 0},  # 账实相符（无库存行）
+    ]).json()
+    r = commit_from_preview(client, preview, reason="账实相符留痕")
+    assert r.status_code == 201, r.text
+    assert [i["difference"] for i in r.json()["items"]] == [0, 0]
+
+    # 库存行（含 updated_at）与“无库存行”状态均不变化，但盘点明细已留痕
+    assert get_inventory(client, s1).json() == before_s1
+    assert get_inventory(client, s2).json() == before_s2
+    got = client.get(f"/inventory-counts/{r.json()['id']}").json()
+    assert got["reason"] == "账实相符留痕"
+    assert [(i["sample_id"], i["book_count"], i["actual_count"], i["difference"])
+            for i in got["items"]] == [(s1, 5, 5, 0), (s2, 0, 0, 0)]
+
+
+def test_commit_inventory_count_stale_book_count_returns_409_and_changes_nothing(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+
+    preview = count_preview(client, [
+        {"sample_id": s1, "actual_count": 8},
+        {"sample_id": s2, "actual_count": 9},
+    ]).json()
+    # 预演之后、提交之前 S1 发生制备消耗：账面由 10 变为 9
+    prepare(client, s1, 1)
+
+    r = commit_from_preview(client, preview)
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["message"] == "库存快照与预演不一致，盘点已拒绝"
+    assert detail["conflicts"] == [{
+        "sample_id": s1, "sample_name": "S1",
+        "expected_book_count": 10, "current_book_count": 9,
+        "issue": "book_count_changed",
+    }]
+
+    # 整单不改：S1 保持制备后的 9，未冲突的 S2 也不被调整，盘点记录不留存
+    assert get_inventory(client, s1).json()["balance"] == 9
+    assert get_inventory(client, s2).json()["balance"] == 10
+    assert client.get("/inventory-counts/1").status_code == 404
+
+    # 以最新账面重新预演后可成功提交
+    preview2 = count_preview(client, [
+        {"sample_id": s1, "actual_count": 8},
+        {"sample_id": s2, "actual_count": 9},
+    ]).json()
+    r2 = commit_from_preview(client, preview2)
+    assert r2.status_code == 201, r2.text
+    assert get_inventory(client, s1).json()["balance"] == 8
+    assert get_inventory(client, s2).json()["balance"] == 9
+
+
+def test_commit_inventory_count_reports_all_conflicting_items_sorted(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+
+    preview = count_preview(client, [
+        {"sample_id": s1, "actual_count": 1},
+        {"sample_id": s2, "actual_count": 2},
+    ]).json()
+    # 两个样本的账面都在预演后变化：冲突项全部返回且按样本 id 升序
+    add_inventory(client, s1, 2)
+    add_inventory(client, s2, 3)
+    r = commit_from_preview(client, preview)
+    assert r.status_code == 409
+    assert [c["sample_id"] for c in r.json()["detail"]["conflicts"]] == [s1, s2]
+    assert [c["current_book_count"] for c in r.json()["detail"]["conflicts"]] == [12, 13]
+    # 余额维持补库后的值，盘点记录不留存
+    assert get_inventory(client, s1).json()["balance"] == 12
+    assert get_inventory(client, s2).json()["balance"] == 13
+    assert client.get("/inventory-counts/1").status_code == 404
+
+
+def test_commit_inventory_count_rejects_unknown_and_non_sample_with_409(client):
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+
+    # 混样批次：预演阶段即 400
+    preview = count_preview(client, [{"sample_id": p1, "actual_count": 1}])
+    assert preview.status_code == 400
+
+    # 提交体中的账面/实盘数合法，但样本不是原始样本（绕过预演直接构造）：
+    # 写事务内复核仍须拦截，返回 409 冲突
+    r = commit_count(client, [
+        {"sample_id": p1, "book_count": 0, "actual_count": 1},
+        {"sample_id": s1, "book_count": 0, "actual_count": 1},
+    ])
+    assert r.status_code == 409, r.text
+    conflicts = r.json()["detail"]["conflicts"]
+    assert conflicts == [{
+        "sample_id": p1, "sample_name": "P1",
+        "expected_book_count": 0, "current_book_count": 0,
+        "issue": "not_original_sample",
+    }]
+    # 整单不改：S1 也不被盘入，不留记录
+    assert get_inventory(client, s1).json()["balance"] == 0
+    assert client.get("/inventory-counts/1").status_code == 404
+
+    # 未知批次同样在提交复核中返回 409
+    r = commit_count(client, [
+        {"sample_id": 999, "book_count": 0, "actual_count": 1}])
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicts"] == [{
+        "sample_id": 999, "sample_name": None,
+        "expected_book_count": 0, "current_book_count": None,
+        "issue": "not_original_sample",
+    }]
+
+
+def test_commit_inventory_count_validation_errors(client):
+    s1 = make_sample(client, "S1")
+
+    # 空清单 / 缺原因 → 422
+    assert client.post("/inventory-counts", json={"items": [], "reason": "x"}).status_code == 422
+    r = client.post("/inventory-counts", json={"items": [
+        {"sample_id": s1, "book_count": 0, "actual_count": 1}]})
+    assert r.status_code == 422
+
+    # 样本 id 重复 → 422
+    r = commit_count(client, [
+        {"sample_id": s1, "book_count": 0, "actual_count": 1},
+        {"sample_id": s1, "book_count": 0, "actual_count": 2},
+    ], reason="重复")
+    assert r.status_code == 422
+    assert "重复" in r.json()["detail"][0]["msg"]
+
+    # 空 / 纯空白原因 → 422
+    for reason in ("", "   "):
+        assert commit_count(client, [
+            {"sample_id": s1, "book_count": 0, "actual_count": 1}], reason).status_code == 422
+
+    # 账面数 / 实盘数为负数、小数、字符串、布尔 → 422
+    for bad in (-1, 1.5, 2.0, "2", True):
+        assert commit_count(client, [
+            {"sample_id": s1, "book_count": bad, "actual_count": 1}]).status_code == 422
+        assert commit_count(client, [
+            {"sample_id": s1, "book_count": 0, "actual_count": bad}]).status_code == 422
+
+
+def test_get_inventory_count_unknown_returns_404(client):
+    r = client.get("/inventory-counts/4242")
+    assert r.status_code == 404
+    assert "4242" in r.json()["detail"]
+
+
+def test_inventory_count_details_remain_unchanged_as_balances_move(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 10)
+    preview = count_preview(client, [{"sample_id": s1, "actual_count": 7}]).json()
+    created = commit_from_preview(client, preview).json()
+    assert get_inventory(client, s1).json()["balance"] == 7
+
+    # 盘点之后余额继续变动：已提交明细是历史快照，不被改写
+    add_inventory(client, s1, 5)
+    prepare(client, s1, 2)
+    assert get_inventory(client, s1).json()["balance"] == 10
+    got = client.get(f"/inventory-counts/{created['id']}").json()
+    assert got == created
+    assert got["items"] == [{
+        "sample_id": s1, "sample_name": "S1",
+        "book_count": 10, "actual_count": 7, "difference": -3}]
+
+
+def test_concurrent_inventory_counts_serialize(client):
+    # 两个盘点单都基于同一账面预演：写事务串行使后提交者必然发现账面已被
+    # 先提交者改为实盘值，从而 409——不允许两次盘点都生效；
+    # 哪个线程先提交取决于调度，最终余额必须等于先提交单的实盘数
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 10)
+    bodies = {
+        8: count_preview(client, [{"sample_id": s1, "actual_count": 8}]).json(),
+        6: count_preview(client, [{"sample_id": s1, "actual_count": 6}]).json(),
+    }
+    barrier = threading.Barrier(2)
+    codes: list[int] = []
+    winner: list[int] = []
+    lock = threading.Lock()
+
+    def submit(actual, body):
+        barrier.wait()
+        r = commit_from_preview(client, body)
+        with lock:
+            codes.append(r.status_code)
+            if r.status_code == 201:
+                winner.append(actual)
+
+    threads = [threading.Thread(target=submit, args=(8, bodies[8])),
+               threading.Thread(target=submit, args=(6, bodies[6]))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(codes) == [201, 409]
+    assert len(winner) == 1
+    assert get_inventory(client, s1).json()["balance"] == winner[0]
+    # 仅成功的一单留有记录，且明细为获胜单的账面/实盘数
+    rec = client.get("/inventory-counts/1")
+    assert rec.status_code == 200
+    assert rec.json()["items"][0]["actual_count"] == winner[0]
+    assert rec.json()["items"][0]["book_count"] == 10
+    assert client.get("/inventory-counts/2").status_code == 404

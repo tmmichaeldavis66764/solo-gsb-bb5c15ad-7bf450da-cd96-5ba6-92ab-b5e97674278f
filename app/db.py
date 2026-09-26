@@ -82,6 +82,27 @@ CREATE TABLE IF NOT EXISTS sample_seal_events (
 
 CREATE INDEX IF NOT EXISTS idx_sample_seal_events_sample
     ON sample_seal_events (sample_id, id);
+
+CREATE TABLE IF NOT EXISTS inventory_counts (
+    -- 一次原始样本库存盘点单：提交原因与时间；各样本账面/实盘/差额见 inventory_count_items
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    reason     TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS inventory_count_items (
+    -- 盘点单明细：提交时在写事务内核对仍为原始样本且账面余额与预演值一致后写入，
+    -- 保存调整前账面数、实盘数、有符号差额（实盘 - 账面）；只追加，不随余额变化改写
+    count_id     INTEGER NOT NULL REFERENCES inventory_counts (id) ON DELETE CASCADE,
+    sample_id    INTEGER NOT NULL REFERENCES batches (id),
+    book_count   INTEGER NOT NULL CHECK (book_count >= 0),
+    actual_count INTEGER NOT NULL CHECK (actual_count >= 0),
+    difference   INTEGER NOT NULL,
+    PRIMARY KEY (count_id, sample_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_inventory_count_items_count
+    ON inventory_count_items (count_id, sample_id);
 """
 
 

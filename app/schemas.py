@@ -343,3 +343,76 @@ class SelectionPreviewOut(BaseModel):
     consumptions: list[PreparationConsumptionOut]
     # 同一库存快照下满足入选消耗后的剩余库存（只列被消耗样本），按样本 id 升序
     remaining_inventory: list[InventoryOut]
+
+
+class InventoryCountItem(BaseModel):
+    """盘点项：一个原始样本 id 与实盘非负整数份数。"""
+
+    sample_id: StrictPositiveInt
+    actual_count: StrictNonNegativeInt
+
+
+class InventoryCountPreviewRequest(BaseModel):
+    """库存盘点预演：非空且样本 id 不重复的盘点项清单。
+
+    按同一库存快照返回各样本账面数与差额（实盘 - 账面），无库存行按 0；
+    预演只读，不写库。
+    """
+
+    items: Annotated[list[InventoryCountItem], Field(min_length=1)]  # 拒绝空清单
+
+    @model_validator(mode="after")
+    def _validate(self) -> InventoryCountPreviewRequest:
+        ids = [item.sample_id for item in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("盘点样本 id 不得重复")
+        return self
+
+
+class InventoryCountCommitItem(InventoryCountItem):
+    """提交盘点项：实盘数之外须携带预演时返回的账面数，提交时在写事务内复核。"""
+
+    book_count: StrictNonNegativeInt
+
+
+class InventoryCountCommitRequest(BaseModel):
+    """提交盘点单：非空且样本 id 不重复的盘点项（含预演账面数）+ 非空白原因。"""
+
+    items: Annotated[list[InventoryCountCommitItem], Field(min_length=1)]
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+
+    @model_validator(mode="after")
+    def _validate(self) -> InventoryCountCommitRequest:
+        ids = [item.sample_id for item in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("盘点样本 id 不得重复")
+        return self
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_must_not_be_blank(cls, value: str) -> str:
+        # 与封存原因一致：纯空白原因无追溯意义，与空字符串一并拒绝（422）
+        if not value.strip():
+            raise ValueError("原因不能为空或纯空白")
+        return value
+
+
+class InventoryCountPreviewItemOut(BaseModel):
+    sample_id: int
+    sample_name: str
+    book_count: int    # 同一快照下的账面数（份），无库存行按 0
+    actual_count: int  # 请求中的实盘数（非负整数份）
+    difference: int    # 有符号差额 = 实盘 - 账面
+
+
+class InventoryCountPreviewOut(BaseModel):
+    items: list[InventoryCountPreviewItemOut]  # 按样本 id 升序；预演不写库
+
+
+class InventoryCountOut(BaseModel):
+    """已提交盘点单：原因、提交时间与各样本调整前后数（账面/实盘）及差额。"""
+
+    id: int
+    reason: str
+    created_at: str
+    items: list[InventoryCountPreviewItemOut]  # 按样本 id 升序
