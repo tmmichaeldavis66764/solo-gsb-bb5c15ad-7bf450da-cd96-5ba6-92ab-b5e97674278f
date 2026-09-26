@@ -18,6 +18,7 @@
 - **只读排产预演**：`POST /preparation-jobs/selection-preview` 接收 **1～12 条候选制备单**（每条为已有批次 id + 正整数次数，按请求位置标识订单，**允许重复批次**、不合并次数），复用配方图整数消耗展开计算每条订单对原始样本的需求，依据**同一库存快照**选出各样本总需求均不超过余额的子集——先**最大化入选订单数**，再**最大化入选制备次数之和**，仍并列时取**入选位置序列字典序最小**者；返回入选/未入选位置、按样本汇总的消耗与剩余库存，库存全不足时返回空集；**不扣减库存、不创建制备记录**
 - **制备记录冲正**：`POST /preparations/{id}/reversal` 对**存在且尚未冲正**的制备记录，按记录**已保存的消耗明细逐样本返还**原始样本库存，并保存与该记录**一一对应**的冲正时间；读取记录、判重、返还与保存在**同一 SQLite 写事务**内完成；**重复冲正幂等**返回同一冲正记录（200）且不再次返还，未知制备记录返回 **404**。`GET /preparations/{id}/reversal` 查询冲正时间、各样本返还份数与当前库存（明细按样本 id 升序），未冲正返回 **404**。单批制备与整单制备生成的记录均可冲正；冲正**不删改**原制备记录与消耗明细，`GET /preparations/{id}` 照常可查
 - **原始样本质量封存**：可对已有**原始样本**封存（`POST /batches/{id}/seal`）与解除封存（`POST /batches/{id}/unseal`），每次状态变更都必须给出**原因**并记录**时间**，`GET /batches/{id}/seal` 查询当前状态与**全部状态变更历史**；仅原始样本可封存（混样批次返回 **400**），**同一状态重复操作返回 409**（不新增流水）。单批制备与整单制备在同一 SQLite 写事务内沿**现有配方图**（含嵌套混样、多路径汇合）识别本次会消耗的全部上游原始样本，任一处于封存中即返回 **409** 与按样本 id 升序的**封存样本清单**，**整次请求不扣库存、不写制备记录**（封存检查先于库存缺口检查）；**解除封存后可再次制备**。封存状态变更与制备核算共用 `BEGIN IMMEDIATE` 写事务串行化，并发封存不会被制备漏拦；封存不影响**历史制备记录**的查询与冲正
+- **原始样本库存盘点**：`POST /inventory-counts/preview` 接收**非空且样本 id 不重复**的盘点项（样本 id + 实盘**非负整数**份数），按**同一库存快照**返回各项账面数（**无库存行按 0**）与差额，**只读不写库**；`POST /inventory-counts` 接收盘点项、预演账面数与**非空白原因**，在**同一 SQLite 写事务**内核对全部样本**仍为原始样本**且余额**与预演账面数一致**——任一变化返回 **409** 与冲突项、**整单不改库存、不留记录**，全部一致时按实盘数更新余额（无库存行的样本新建库存行）并保存各项**调整前后数、差额、原因与时间**；`GET /inventory-counts/{id}` 查询已提交的盘点明细
 - 依赖安装与数据库建表全部纳入启动流程，无需手工初始化
 
 ## 快速开始（Docker）
@@ -74,6 +75,9 @@ docker compose up --build
 | `GET` | `/preparations/{id}` | 按记录 id 查询制备记录（消耗明细 + 当前剩余库存） |
 | `POST` | `/preparations/{id}/reversal` | 制备记录冲正：按已保存消耗明细逐样本返还库存（重复冲正幂等，未知记录 404） |
 | `GET` | `/preparations/{id}/reversal` | 查询冲正时间、各样本返还份数及当前库存（未冲正 404） |
+| `POST` | `/inventory-counts/preview` | 库存盘点预演：同一库存快照返回账面数与实盘差额（只读，不写库） |
+| `POST` | `/inventory-counts` | 提交盘点：核对账面数一致后按实盘数更新余额（任一变化 409 且整单回滚） |
+| `GET` | `/inventory-counts/{id}` | 查询已提交的盘点明细（调整前后数、差额、原因与时间） |
 
 ## 示例请求
 
@@ -689,6 +693,74 @@ curl -X POST http://localhost:8000/batches/4/preparations \
 - **并发安全**：封存/解除与制备核算都以 `BEGIN IMMEDIATE` 立即获取 SQLite 写锁，状态变更与制备相互串行——封存事务一旦提交，随后开始的制备必然读到封存状态并返回 409，不会出现“封存已生效却制备成功”的漏拦；
 - 原因缺失、为空或纯空白返回 **422**；未知批次或混样批次返回 **400**；同一状态重复操作返回 **409**。
 
+### 15. 原始样本库存盘点（预演 → 提交 → 查询）
+
+**盘点预演**：`POST /inventory-counts/preview` 接收**非空且样本 id 不重复**的盘点项列表 `items`（每项为 `sample_id` + 实盘**非负整数**份数 `counted`），在**同一库存快照**（显式只读事务，并发补库/制备/盘点不会混入预演中途）下返回各项的账面数 `book_balance`（**无库存行按 0**）、实盘数与差额 `delta = counted − book_balance`，按样本 id 升序。预演**不写库**：不改库存、不留盘点记录。未知批次或混样批次返回 **400**；空清单、重复样本 id、负数/非整数份数返回 **422**。
+
+```bash
+# S1=1 账面 10 份，S2=2 从未补入（账面按 0）
+curl -X POST http://localhost:8000/inventory-counts/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"items": [{"sample_id": 1, "counted": 7}, {"sample_id": 2, "counted": 2}]}'
+```
+
+```json
+{
+  "items": [
+    {"sample_id": 1, "sample_name": "S1", "book_balance": 10, "counted": 7, "delta": -3},
+    {"sample_id": 2, "sample_name": "S2", "book_balance": 0,  "counted": 2, "delta": 2}
+  ]
+}
+```
+
+**提交盘点**：`POST /inventory-counts` 接收盘点项（`sample_id` + `counted` + 预演返回的账面数 `book_balance`）与**非空白原因** `reason`。服务端在**同一 SQLite 写事务**（`BEGIN IMMEDIATE`）内核对全部样本**仍为原始样本**且当前余额**与预演账面数一致**（无库存行按 0）：
+
+- **任一变化**（样本不存在或已不是原始样本、余额与预演账面数不符）→ **409**，`detail.conflicts` 按样本 id 升序给出冲突项的预演账面数与当前余额，**整单不改库存、不留盘点记录**，可按新余额重新预演后再提交；
+- **全部一致** → 按实盘数更新各样本余额（无库存行的样本新建库存行），保存盘点单（原因、提交时间）与各项的**调整前账面数、调整后实盘数、差额**，返回 **201**。
+
+```bash
+curl -X POST http://localhost:8000/inventory-counts \
+  -H 'Content-Type: application/json' \
+  -d '{"items": [{"sample_id": 1, "counted": 7, "book_balance": 10}, {"sample_id": 2, "counted": 2, "book_balance": 0}], "reason": "月末盘点"}'
+```
+
+```json
+{
+  "id": 1,
+  "reason": "月末盘点",
+  "created_at": "2026-09-26T10:00:00.000Z",
+  "items": [
+    {"sample_id": 1, "sample_name": "S1", "book_balance": 10, "counted": 7, "delta": -3},
+    {"sample_id": 2, "sample_name": "S2", "book_balance": 0,  "counted": 2, "delta": 2}
+  ]
+}
+```
+
+预演到提交之间余额被并发改动（如另一终端制备扣减）时，基于旧账面数的提交被拒绝：
+
+```json
+{
+  "detail": {
+    "message": "盘点预演已过期，请重新预演",
+    "conflicts": [
+      {"sample_id": 1, "sample_name": "S1", "expected_book_balance": 10, "current_balance": 7}
+    ]
+  }
+}
+```
+
+**查询盘点**：`GET /inventory-counts/{id}` 返回已提交盘点的明细（单头原因、时间与各项调整前后数、差额，按样本 id 升序）；记录不存在返回 **404**。
+
+```bash
+curl http://localhost:8000/inventory-counts/1
+```
+
+说明：
+
+- 账实相符（差额为 0）与实盘清零（`counted` 为 0）都是合法盘点项；盘点会刷新样本库存的 `updated_at`；
+- 提交时混样批次或未知 id 与余额不一致一样按 **409** 冲突项返回（`current_balance` 为 `null`），整单回滚；
+- 盘点只调整**原始样本**库存余额，不影响批次、配方、制备记录与封存状态；盘点记录一旦提交不可改，如需修正请按新账面数再盘点一次。
+
 ### 错误示例
 
 ```bash
@@ -836,6 +908,30 @@ curl -X POST http://localhost:8000/batches/4/preparations -H 'Content-Type: appl
 curl -X POST http://localhost:8000/preparation-jobs -H 'Content-Type: application/json' \
   -d '{"items": [{"batch_id": 4, "times": 1}]}'
 # {"detail":{"message":"上游原始样本已封存，禁止制备","sealed_samples":[{"sample_id":1,"sample_name":"S1"}]}}
+
+# 盘点预演：空清单 / 样本 id 重复 / 实盘为负数或非整数 → 422
+curl -X POST http://localhost:8000/inventory-counts/preview -H 'Content-Type: application/json' \
+  -d '{"items": []}'
+curl -X POST http://localhost:8000/inventory-counts/preview -H 'Content-Type: application/json' \
+  -d '{"items": [{"sample_id": 1, "counted": 1}, {"sample_id": 1, "counted": 2}]}'
+curl -X POST http://localhost:8000/inventory-counts/preview -H 'Content-Type: application/json' \
+  -d '{"items": [{"sample_id": 1, "counted": -1}]}'
+
+# 盘点预演：未知批次 / 混样批次 → 400（只有原始样本可盘点）
+curl -X POST http://localhost:8000/inventory-counts/preview -H 'Content-Type: application/json' \
+  -d '{"items": [{"sample_id": 999, "counted": 1}]}'
+
+# 提交盘点：原因为空或纯空白 → 422
+curl -X POST http://localhost:8000/inventory-counts -H 'Content-Type: application/json' \
+  -d '{"items": [{"sample_id": 1, "counted": 7, "book_balance": 10}], "reason": "   "}'
+
+# 提交盘点：预演后余额已变化（账面数过期）→ 409 冲突项，整单不改库存、不留记录
+curl -X POST http://localhost:8000/inventory-counts -H 'Content-Type: application/json' \
+  -d '{"items": [{"sample_id": 1, "counted": 7, "book_balance": 10}], "reason": "月末盘点"}'
+# {"detail":{"message":"盘点预演已过期，请重新预演","conflicts":[{"sample_id":1,"sample_name":"S1","expected_book_balance":10,"current_balance":7}]}}
+
+# 查询不存在的盘点记录 → 404
+curl http://localhost:8000/inventory-counts/999
 ```
 
 ## 占比计算说明
@@ -859,12 +955,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入、原始样本封存/解除/查询、批次制备、整单制备、只读排产预演与制备记录冲正端点）
-  db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则、库存、制备记录与冲正记录、封存状态与变更流水表及写事务设置）
-  schemas.py    # Pydantic 请求/响应模型（含严格正整数校验、封存原因非空白校验）
+  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入、原始样本封存/解除/查询、批次制备、整单制备、只读排产预演、制备记录冲正与库存盘点端点）
+  db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则、库存、制备记录与冲正记录、封存状态与变更流水、盘点单与盘点明细表及写事务设置）
+  schemas.py    # Pydantic 请求/响应模型（含严格正整数校验、封存/盘点原因非空白校验、盘点项非空不重复校验）
   service.py    # 递归占比计算、配方图可达原始样本、禁配补录影响预演、目标占比反算、配方预演、份数诊断、制备整数消耗与排产子集选型（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、整单制备、只读排产预演、制备冲正幂等与返还、封存状态机与制备封存拦截、并发与各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、整单制备、只读排产预演、制备冲正幂等与返还、封存状态机与制备封存拦截、库存盘点预演/提交/查询与并发冲突、并发与各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt

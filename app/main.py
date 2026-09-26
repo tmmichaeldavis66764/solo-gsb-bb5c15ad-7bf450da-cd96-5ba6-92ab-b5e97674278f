@@ -22,6 +22,9 @@
 - GET  /preparations/{preparation_id}  按记录 id 查询制备记录（含消耗明细与当前剩余库存）
 - POST /preparations/{preparation_id}/reversal 制备记录冲正：按已保存消耗明细逐样本返还库存（重复冲正幂等，未知记录 404）
 - GET  /preparations/{preparation_id}/reversal 查询冲正时间、各样本返还份数及当前库存（未冲正 404）
+- POST /inventory-counts/preview       库存盘点预演：同一库存快照返回各样本账面数与实盘差额（只读，不写库）
+- POST /inventory-counts               提交盘点：写事务内核对账面数一致后按实盘数更新余额（任一变化 409 且整单回滚）
+- GET  /inventory-counts/{count_id}    查询已提交的盘点明细（调整前后数、差额、原因与时间）
 """
 from __future__ import annotations
 
@@ -45,6 +48,12 @@ from .schemas import (
     ImpactPreviewOut,
     ImpactPreviewRequest,
     InventoryAddRequest,
+    InventoryCountCreateRequest,
+    InventoryCountItemOut,
+    InventoryCountOut,
+    InventoryCountPreviewItemOut,
+    InventoryCountPreviewOut,
+    InventoryCountPreviewRequest,
     InventoryOut,
     PoolCreate,
     PoolPlanOut,
@@ -1494,3 +1503,213 @@ def preview_preparation_job_selection(
             for sid in sample_ids
         ],
     )
+
+
+def _build_inventory_count_out(
+    conn: sqlite3.Connection, count: sqlite3.Row
+) -> InventoryCountOut:
+    """组装盘点单响应：单头（原因、提交时间）+ 各样本调整明细（按样本 id 升序）。"""
+    rows = conn.execute(
+        """
+        SELECT ici.sample_id, b.name AS sample_name,
+               ici.book_balance, ici.counted, ici.delta
+        FROM inventory_count_items ici
+        JOIN batches b ON b.id = ici.sample_id
+        WHERE ici.count_id = ?
+        ORDER BY ici.sample_id
+        """,
+        (count["id"],),
+    ).fetchall()
+    return InventoryCountOut(
+        id=count["id"],
+        reason=count["reason"],
+        created_at=count["created_at"],
+        items=[
+            InventoryCountItemOut(
+                sample_id=r["sample_id"],
+                sample_name=r["sample_name"],
+                book_balance=r["book_balance"],
+                counted=r["counted"],
+                delta=r["delta"],
+            )
+            for r in rows
+        ],
+    )
+
+
+@app.post(
+    "/inventory-counts/preview",
+    response_model=InventoryCountPreviewOut,
+    summary="库存盘点预演：同一库存快照返回账面数与实盘差额（不写库）",
+)
+def preview_inventory_count(
+    payload: InventoryCountPreviewRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> InventoryCountPreviewOut:
+    ids = sorted(item.sample_id for item in payload.items)
+    placeholders = ", ".join("?" for _ in ids)
+
+    # 显式只读事务：存在性/类型校验与余额读取落在同一库存快照中，
+    # 并发补库/制备/盘点不会在预演中途混入；纯 SELECT 不阻塞其他写事务
+    conn.execute("BEGIN")
+    try:
+        rows = {
+            r["id"]: r
+            for r in conn.execute(
+                f"SELECT id, name, kind FROM batches WHERE id IN ({placeholders})", ids
+            )
+        }
+        # 未知批次 / 非原始样本沿用库存接口约定返回 400
+        missing = [i for i in ids if i not in rows]
+        if missing:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}"
+            )
+        not_samples = [i for i in ids if rows[i]["kind"] != "sample"]
+        if not_samples:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=f"盘点对象必须是原始样本（kind='sample'）: {not_samples}",
+            )
+        balances = {
+            r["sample_id"]: r["balance"]
+            for r in conn.execute(
+                f"SELECT sample_id, balance FROM sample_inventory WHERE sample_id IN ({placeholders})",
+                ids,
+            )
+        }
+    finally:
+        conn.rollback()  # 只读预演：任何路径都不落盘
+
+    counted_by_id = {item.sample_id: item.counted for item in payload.items}
+    return InventoryCountPreviewOut(
+        items=[
+            InventoryCountPreviewItemOut(
+                sample_id=sid,
+                sample_name=rows[sid]["name"],
+                book_balance=balances.get(sid, 0),  # 无库存行按 0
+                counted=counted_by_id[sid],
+                delta=counted_by_id[sid] - balances.get(sid, 0),
+            )
+            for sid in ids
+        ]
+    )
+
+
+@app.post(
+    "/inventory-counts",
+    response_model=InventoryCountOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="提交库存盘点：核对预演账面数后按实盘数更新余额（任一变化 409 且整单回滚）",
+)
+def create_inventory_count(
+    payload: InventoryCountCreateRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> InventoryCountOut:
+    items = sorted(payload.items, key=lambda item: item.sample_id)
+    ids = [item.sample_id for item in items]
+    placeholders = ", ".join("?" for _ in ids)
+
+    # 核对、余额更新与盘点记录写入必须在同一 SQLite 写事务内完成：
+    # BEGIN IMMEDIATE 立即取写锁，预演到提交之间的并发库存变化必然被核对拦截
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = {
+            r["id"]: r
+            for r in conn.execute(
+                f"SELECT id, name, kind FROM batches WHERE id IN ({placeholders})", ids
+            )
+        }
+        balances = {
+            r["sample_id"]: r["balance"]
+            for r in conn.execute(
+                f"SELECT sample_id, balance FROM sample_inventory WHERE sample_id IN ({placeholders})",
+                ids,
+            )
+        }
+
+        # 核对全部样本仍为原始样本且当前余额与预演账面数一致（无库存行按 0）；
+        # 任一变化即整单回滚：不改库存、不留盘点记录
+        conflicts = []
+        for item in items:
+            row = rows.get(item.sample_id)
+            if row is None or row["kind"] != "sample":
+                conflicts.append({
+                    "sample_id": item.sample_id,
+                    "sample_name": row["name"] if row is not None else None,
+                    "expected_book_balance": item.book_balance,
+                    "current_balance": None,
+                })
+                continue
+            current = balances.get(item.sample_id, 0)
+            if current != item.book_balance:
+                conflicts.append({
+                    "sample_id": item.sample_id,
+                    "sample_name": row["name"],
+                    "expected_book_balance": item.book_balance,
+                    "current_balance": current,
+                })
+        if conflicts:
+            conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"message": "盘点预演已过期，请重新预演", "conflicts": conflicts},
+            )
+
+        # 全部一致：保存盘点单（原因、时间）与各样本调整前后数、差额，
+        # 并按实盘数更新余额（无库存行的样本新建库存行；UPSERT 与补入库存一致）
+        cur = conn.execute(
+            "INSERT INTO inventory_counts (reason) VALUES (?)", (payload.reason,)
+        )
+        count_id = cur.lastrowid
+        for item in items:
+            conn.execute(
+                """
+                INSERT INTO inventory_count_items
+                    (count_id, sample_id, book_balance, counted, delta)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    count_id,
+                    item.sample_id,
+                    item.book_balance,
+                    item.counted,
+                    item.counted - item.book_balance,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO sample_inventory (sample_id, balance, updated_at)
+                VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                ON CONFLICT (sample_id) DO UPDATE SET
+                    balance = excluded.balance,
+                    updated_at = excluded.updated_at
+                """,
+                (item.sample_id, item.counted),
+            )
+        conn.commit()
+    except HTTPException:
+        raise
+
+    count = conn.execute(
+        "SELECT * FROM inventory_counts WHERE id = ?", (count_id,)
+    ).fetchone()
+    return _build_inventory_count_out(conn, count)
+
+
+@app.get(
+    "/inventory-counts/{count_id}",
+    response_model=InventoryCountOut,
+    summary="按 id 查询已提交的盘点明细（调整前后数、差额、原因与时间）",
+)
+def get_inventory_count(
+    count_id: int, conn: sqlite3.Connection = Depends(get_db)
+) -> InventoryCountOut:
+    count = conn.execute(
+        "SELECT * FROM inventory_counts WHERE id = ?", (count_id,)
+    ).fetchone()
+    if count is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail=f"盘点记录不存在: {count_id}"
+        )
+    return _build_inventory_count_out(conn, count)
